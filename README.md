@@ -188,3 +188,13 @@ These permutation-derived p-values tell you how often a performance
 as good as the observed one would occur if there were no true
 relationship between X and y. Usually, statistical significance is claimed when p < 0.05.
 
+# CODE: HOW TO USE IT? 
+## FROM DATA GENERATION, PREDICTION WITH RESAMPLING TO INTERPRETATION OF PERMUTATION TESTS
+
+📊 **How to use the code and interpret it under known conditions:**  
+See [`figs/Figs_NoFx/README.md`](figs/Figs_NoFx/README.md)
+
+If we generate synthetic data independent from the classes, we will get some null-level performances like this:
+![](figs/Figs_NoFx/pls_cv_summary_nofx.png)
+
+
