@@ -1,22 +1,32 @@
-function [cvCombi, cvRuns] = runRepeatedCV_TrainPLSLDA_PredictOutOfFold(XFeats, YLabel, subjID, priorType, cvOpts)
+function [cvCombi, cvReps] = runRepeatedCV_TrainPLSLDA_PredictOutOfFold(XFeats, YLabel, subjID, cvOpts)
 % Repeated K-fold cross-validation (CV) wrapper for training and evaluating a model:
-%   - Train a model using trainModel_PredictTestSet on the training folds.
-%   - Predict on the test set for each fold and repeat across multiple cross-validation repetitions.
 %
-% Repeated K-fold CV wrapper around:
+% This function is a high-level wrapper that controls the repeated cross-validation workflow and is responsible for:
+%   - generating repeated K-fold partitions,
+%   - collecting strictly out-of-fold predictions across folds and repetitions,
+%   - computing and storing performance metrics and summary statistics.
+%
+% The actual model fitting and prediction logic is fully delegated to the core function:
 %   trainModel_PredictTestSet(Fold_Train_XFeats, Fold_Train_YLabel, Fold_Test_XFeats, priorType)
-%
-% Naming convention: coordinate system first (Rep/Fold/Train/Test/OutOfFold).
+% The core function is invoked once per fold within each repetition:
+%   - the model is trained using only the fold-specific training data,
+%   - predictions are generated exclusively on the corresponding held-out test set.
 %
 % This function supports binary classification (two classes) and produces key performance metrics.
 % For multi-class problems, the metrics are computed using one-vs-all strategies.
+%
+% Naming convention: coordinate system first (Rep/Fold/Train/Test/OutOfFold).
+%   Rep        = repetition index (outer repeated CV loop)
+%   Fold       = fold index within a repetition
+%   Train/Test = data partition within a fold
+%   OutOfFold  = samples never seen during training for that prediction
 %
 % ---------------------- INPUTS ----------------------
 % XFeats        [N×P]  predictors/features (rows = samples/recordings; cols = features)
 % YLabel        [N×1]  binary labels (must match cvOpts.classTypes; e.g., 0/1)
 % subjID        [N×1]  subject identifier used for C2 leakage control
-% priorType     char/string  'uniform' or 'empirical' (used for classifier configuration)
 % cvOpts        struct (optional):
+%   priorType     char/string  'uniform' or 'empirical' (used for classifier configuration)
 %   .numCvReps            scalar int, default 10   - number of cross-validation repetitions
 %   .numCvFolds           scalar int, default 10   - number of folds per CV repetition
 %   .rngSeed              scalar int, default 1    - seed for random number generator
@@ -26,20 +36,28 @@ function [cvCombi, cvRuns] = runRepeatedCV_TrainPLSLDA_PredictOutOfFold(XFeats, 
 %   .posClass             scalar, default 1        - positive class label for AUC/F1 computation
 %
 % ---------------------- OUTPUTS ----------------------
-% cvRuns: repetition-level outputs (reps on rows; includes Rep dimension)
-%   cvRuns.Sample_TrueYLabel                [1×N]   ground truth labels for all samples
-%   cvRuns.Sample_SubjID                    [1×N]   subject identifiers for all samples
-%   cvRuns.RepSample_OutOfFold_Score        [Rep×N] continuous model scores for each sample (NaN if not tested)
-%   cvRuns.RepSample_OutOfFold_PredYLabel   [Rep×N] predicted labels for each sample (NaN if not tested)
-%   cvRuns.RepSample_OutOfFold_TestMask     [Rep×N] logical mask indicating if sample was tested in each rep
-%   cvRuns.Rep_ConfMat_TruePred             [Rep×K×K] confusion matrix per rep (True×Pred, K=number of classes)
-%   cvRuns.Rep_AROC                         [Rep×1] AROC score per repetition
-%   cvRuns.Rep_Acc                          [Rep×1] accuracy score per repetition
-%   cvRuns.Rep_F1_posClass                  [Rep×1] F1 score for positive class (NaN for non-binary cases)
-%   cvRuns.Rep_F1_negClass                  [Rep×1] F1 score for negative class (NaN for non-binary cases)
-%   cvRuns.RepFold_VipScores                [Rep×Fold×P] VIP scores per fold (derived from training data)
-%   cvRuns.RepFold_OptRocPoint              [Rep×Fold×2] Optimal ROC operating point per fold
-%   cvRuns.Rep_Vip_MeanAcrossFolds          [Rep×P] Mean VIP scores across all folds within a repetition
+% cvReps: repetition-level outputs (reps on rows; includes Rep dimension)
+%   cvReps.Sample_TrueYLabel                [1×N]   ground truth labels for all samples
+%   cvReps.Sample_SubjID                    [1×N]   subject identifiers for all samples
+%   cvReps.RepSample_OutOfFold_Score        [Rep×N] continuous model scores for each sample (NaN if not tested)
+%   cvReps.RepSample_OutOfFold_PredYLabel   [Rep×N] predicted labels for each sample (NaN if not tested)
+%   cvReps.RepSample_OutOfFold_TestMask     [Rep×N] logical mask indicating if sample was tested in each rep
+%   cvReps.Rep_ConfMat_TruePred             [Rep×K×K] confusion matrix per rep (True×Pred, K=number of classes)
+%   cvReps.Rep_AROC                         [Rep×1] AROC score per repetition
+%   cvReps.Rep_Acc                          [Rep×1] accuracy score per repetition
+%   cvReps.Rep_F1_posClass                  [Rep×1] F1 score for positive class (NaN for non-binary cases)
+%   cvReps.Rep_F1_negClass                  [Rep×1] F1 score for negative class (NaN for non-binary cases)
+%   cvReps.RepFold_VipScores                [Rep×Fold×P] VIP scores per fold (derived from training data)
+%   cvReps.RepFold_OptRocPoint              [Rep×Fold×2] Optimal ROC operating point per fold
+%   cvReps.Rep_Vip_MeanAcrossFolds          [Rep×P] Mean VIP scores across all folds within a repetition
+%---------   ROC points at each run. Grid approach:
+%   cvReps.RepRoc_FPRgrid                   [1×G]   fixed FPR grid used to interpolate ROC curves
+%   cvReps.RepRoc_TPRgrid                   [Rep×G] TPR values interpolated onto fixed FPR grid (safe for averaging)
+%---------   ROC points at each run. Unique FPR point approach:
+%   cvReps.RepRoc_nRocPts                   [Rep×1] number of unique ROC points returned by perfcurve per repetition
+%   cvReps.RepRoc_FPRu                      [Rep×Lmax] unique FPR coordinates per rep (NaN-padded)
+%   cvReps.RepRoc_TPRu                      [Rep×Lmax] TPR values at unique FPR coordinates per rep (NaN-padded)
+%   cvReps.RepRoc_Thru                      [Rep×Lmax] decision thresholds corresponding to unique ROC points (NaN-padded)
 
 % cvCombi: aggregated outputs ONLY (no Rep dimension)
 %   cvCombi.OverReps_Med_OutOfFold_Score   [N×1]  median score over reps for each sample (computed via prctile)
@@ -52,7 +70,7 @@ function [cvCombi, cvRuns] = runRepeatedCV_TrainPLSLDA_PredictOutOfFold(XFeats, 
 %   cvCombi.OverReps_Mean_ConfMat_PredTrue         [K×K]   mean confusion matrix (Pred×True), transposed for plotting consistency
 %   cvCombi.OverReps_MeanPct_ConfMat_PredTrue      [K×K]   column-normalized confusion matrix (% of TRUE class)
 
-% ---------------------- CRUCIAL LOGIC ----------------------
+%% ---------------------- Crucial Logic----------------------
 % 1) OutOfFold_*: These variables hold predictions in global sample coordinates. 
 %    They are populated only for the test fold in each repetition.
 %    This guarantees no leakage between training and testing samples.
@@ -63,6 +81,27 @@ function [cvCombi, cvRuns] = runRepeatedCV_TrainPLSLDA_PredictOutOfFold(XFeats, 
 %    This is applicable to binary classification only.
 
 % For multi-class classification, metrics are computed using one-vs-all strategies, including AROC for each class against the rest.
+
+%% ---------------------- ROC storage (stored both as unique points and with fixed-grid) ----------------------
+% function *perfcurve* returns a stepwise ROC obtained by sweeping a threshold over the SCORE ranking.
+%  Conceptually: each time the threshold passes a Negative-class sample, FPR increases; each time it passes a Positive sample, TPR increases.
+%  Given a set of FPR points, the corresponding TPR (ROC y-values) depend on the model quality: they reflect where positives fall in the SCORE ranking (earlier positives => higher TPR at low FPR).
+%  To compare/average ROC curves across Repetitions (aka Runs) we need a common x-axis (FPR points) with fixed length.
+
+% 1) UNIQUE-POINT ROC (RepRoc_FPRu / RepRoc_TPRu / RepRoc_Thru)
+%    - The set of FPR x-values is mainly determined by:
+%        (a) the number of negatives in the evaluated set (FPR step = 1/Nneg),
+%        (b) the presence of SCORE ties (discrete/quantized scores collapse steps).
+%       Hence, as typical, if ROC is computed on pooled OOF (out-of-folds) predictions 
+%       that include the same samples at each rep (eg all the dataset is used in each rep), and if scores are mostly continuous,
+%       the resulting unique FPR values (RepRoc_FPRu) are identical across reps (often with L ? Nneg+1), allowing to average ROC points across reps.
+
+% 2) FIXED FPR GRID ROC (RepRoc_TPRgrid on RepRoc_FPRgrid)
+%    - Tobe able to always compare/average ROC curves across reps, we also ensure a common x-axis with fixed length.
+%      We therefore interpolate TPR onto a predefined FPR grid (RepRoc_FPRgrid) constant across reps.
+%    - Note that, in the approach 1) , unique-point ROC curves can differ across reps (making direct averaging unsafe) when:
+%        • the evaluated set or class counts change (dropouts, per-fold ROC, missing class), or
+%        • SCORE ties differ across reps (discrete posteriors, rounding, hard labels).
 
 %% -------------------- basic checks --------------------
 if nargin < 5 || isempty(cvOpts), cvOpts = struct(); end
@@ -85,6 +124,9 @@ if ~isfield(cvOpts,'avoidTrainOnTestSubj'), cvOpts.avoidTrainOnTestSubj = 1; end
 if ~isfield(cvOpts,'zscoreFromTrain'),      cvOpts.zscoreFromTrain = 1; end
 if ~isfield(cvOpts,'classTypes'),           cvOpts.classTypes = sort(unique(YLabel)); end
 if ~isfield(cvOpts,'posClass'),             cvOpts.posClass = 1; end
+if ~isfield(cvOpts,'priorType') || isempty(cvOpts.priorType)
+    cvOpts.priorType = 'uniform'; %% alt: empirical
+end
 
 numCvReps  = cvOpts.numCvReps;
 numCvFolds = cvOpts.numCvFolds;
@@ -93,38 +135,50 @@ posClass   = cvOpts.posClass;
 
 nClas = numel(classTypes);
 
-%% -------------------- initialize cvRuns (reps on rows) --------------------
-cvRuns = struct();
-cvRuns.cvOpts = cvOpts;
+%% -------------------- initialize cvReps (reps on rows) --------------------
+cvReps = struct();
+cvReps.cvOpts = cvOpts;
 
-cvRuns.Sample_N         = N;
-cvRuns.Sample_P         = P;
-cvRuns.Sample_TrueYLabel = YLabel.'; % 1×N
-cvRuns.Sample_SubjID     = subjID.'; % 1×N
+cvReps.Sample_N         = N;
+cvReps.Sample_P         = P;
+cvReps.Sample_TrueYLabel = YLabel.'; % 1×N
+cvReps.Sample_SubjID     = subjID.'; % 1×N
 
 % OutOfFold stored as Rep × Sample
-cvRuns.RepSample_OutOfFold_Score      = nan(numCvReps, N);
-cvRuns.RepSample_OutOfFold_PredYLabel = nan(numCvReps, N);
-cvRuns.RepSample_OutOfFold_TestMask   = false(numCvReps, N);
+cvReps.RepSample_OutOfFold_Score      = nan(numCvReps, N);
+cvReps.RepSample_OutOfFold_PredYLabel = nan(numCvReps, N);
+cvReps.RepSample_OutOfFold_TestMask   = false(numCvReps, N);
 
 % Rep-level performance (pooled OutOfFold samples within rep)
-cvRuns.Rep_ConfMat_TruePred = nan(numCvReps, nClas, nClas); % True×Pred
-cvRuns.Rep_AROC              = nan(numCvReps, 1);
-cvRuns.Rep_Acc              = nan(numCvReps, 1);
-cvRuns.Rep_F1_posClass       = nan(numCvReps, 1); % binary only
-cvRuns.Rep_F1_negClass       = nan(numCvReps, 1); % binary only
+cvReps.Rep_ConfMat_TruePred = nan(numCvReps, nClas, nClas); % True×Pred
+cvReps.Rep_AROC              = nan(numCvReps, 1);
+cvReps.Rep_Acc              = nan(numCvReps, 1);
+cvReps.Rep_F1_posClass       = nan(numCvReps, 1); % binary only
+cvReps.Rep_F1_negClass       = nan(numCvReps, 1); % binary only
 
 % Fold-level TRAIN-derived quantities
-cvRuns.RepFold_VipScores    = nan(numCvReps, numCvFolds, P);
-cvRuns.RepFold_OptRocPoint  = nan(numCvReps, numCvFolds, 2);
+cvReps.RepFold_VipScores    = nan(numCvReps, numCvFolds, P);
+cvReps.RepFold_OptRocPoint  = nan(numCvReps, numCvFolds, 2);
 
 % Within-rep VIP summary
-cvRuns.Rep_Vip_MeanAcrossFolds = nan(numCvReps, P);
+cvReps.Rep_Vip_MeanAcrossFolds = nan(numCvReps, P);
 
+% roc curve at fixed intervals
+cvReps.RepRoc_FPRgrid = linspace(0,1,101);                 % 1×G % eval the TPR (i.e. ROC curve y points) at these FPR points
+cvReps.RepRoc_TPRgrid = nan(numCvReps, numel(cvReps.RepRoc_FPRgrid)); % TPR corresponding at these FPR points
+
+% roc curve at unique intervals (could potentially change length acrossruns) NaN-pad to N+1 worst case
+% Lmax = N + 1;                                                  % large, extra safe upper bound
+Nneg = sum(YLabel ~= posClass);
+Lmax = Nneg + 1;
+cvReps.RepRoc_FPRu = nan(numCvReps, Lmax); % Rep_FPRu contains only unique FPR values.
+cvReps.RepRoc_TPRu = nan(numCvReps, Lmax); % TPRu values are stored at those unique values taken from FPR 
+cvReps.RepRoc_Thru = nan(numCvReps, Lmax);   % same for thresholds
+cvReps.RepRoc_nRocPts  = zeros(numCvReps, 1);                  % how many valid pts in each row
 %% -------------------- repeated CV --------------------
 for RepIdx = 1:numCvReps
     
-    rng(RepIdx);   %     rng(cvOpts.rngSeed + RepIdx - 1);
+    rng(cvOpts.rngSeed + RepIdx - 1); % seed for reapeatibility. comment out if doing shuffled-permutation or bootstraps!
     
     % Stratified K-fold at SAMPLE level
     cv = cvpartition(YLabel, 'KFold', numCvFolds);
@@ -173,14 +227,17 @@ for RepIdx = 1:numCvReps
         
         % Guard against degenerate training folds after C2 purge
         if isempty(Fold_Train_YLabel) || numel(unique(Fold_Train_YLabel)) < 2
-            continue;
+             disp('empty fold or unique class'); continue;
         end
         
         %=============================================================
         % Core model call (TRAIN only; PREDICT on TEST only)
         %=============================================================
         [Fold_Test_PlsScore, Fold_Test_PredYLabel, Fold_VipScores, Fold_OptRocPoint] = ...
-            trainModel_PredictTestSet(Fold_Train_XFeats, Fold_Train_YLabel, Fold_Test_XFeats, priorType);
+            trainModel_PredictTestSet(Fold_Train_XFeats, Fold_Train_YLabel, Fold_Test_XFeats, cvOpts.priorType);
+        % For each repetition and each fold, the model is trained on the fold-specific training set only
+         % and then applied to the corresponding held-out test set.
+        % Predictions are collected out-of-fold, so every test sample is evaluated without ever being seen during its own training.
         %=============================================================
         
         if numel(Fold_Test_PlsScore) ~= numel(Fold_Test_Idx)
@@ -205,9 +262,9 @@ for RepIdx = 1:numCvReps
     % -------------------- store OutOfFold vectors: Rep × Sample --------------------
     OutOfFold_TestMask = ~isnan(OutOfFold_Score);
     
-    cvRuns.RepSample_OutOfFold_Score(RepIdx,:)      = OutOfFold_Score(:).';
-    cvRuns.RepSample_OutOfFold_PredYLabel(RepIdx,:) = OutOfFold_PredYLabel(:).';
-    cvRuns.RepSample_OutOfFold_TestMask(RepIdx,:)   = OutOfFold_TestMask(:).';
+    cvReps.RepSample_OutOfFold_Score(RepIdx,:)      = OutOfFold_Score(:).';
+    cvReps.RepSample_OutOfFold_PredYLabel(RepIdx,:) = OutOfFold_PredYLabel(:).';
+    cvReps.RepSample_OutOfFold_TestMask(RepIdx,:)   = OutOfFold_TestMask(:).';
     
     % -------------------- per-rep performance on pooled OutOfFold samples --------------------
     if any(OutOfFold_TestMask)
@@ -218,32 +275,49 @@ for RepIdx = 1:numCvReps
         
         % Confusion matrix stored as True×Pred (rows=True, cols=Pred)
         Rep_ConfMat_TruePred = confusionmat(FoldsPool_True, FoldsPool_PredYLabel, 'order', classTypes);
-        cvRuns.Rep_ConfMat_TruePred(RepIdx,:,:) = Rep_ConfMat_TruePred;
+        cvReps.Rep_ConfMat_TruePred(RepIdx,:,:) = Rep_ConfMat_TruePred;
         
         % Binary-smart dense metrics (Acc + F1s). If not binary -> F1s remain NaN.
         [Rep_Acc, Rep_F1_posClass, Rep_F1_negClass] = ...
             metricsFromConfMatBinary_TruePred(Rep_ConfMat_TruePred, classTypes, posClass);
         
         % Always store accuracy (if matrix has counts). For non-binary, helper still returns Acc properly.
-        cvRuns.Rep_Acc(RepIdx)           = Rep_Acc;
-        cvRuns.Rep_F1_posClass(RepIdx)    = Rep_F1_posClass;
-        cvRuns.Rep_F1_negClass(RepIdx) = Rep_F1_negClass;
+        cvReps.Rep_Acc(RepIdx)           = Rep_Acc;
+        cvReps.Rep_F1_posClass(RepIdx)    = Rep_F1_posClass;
+        cvReps.Rep_F1_negClass(RepIdx) = Rep_F1_negClass;
         
         % AROC (defined only if both classes present in tested subset)
         if numel(unique(FoldsPool_True)) > 1
-            [~,~,~,Rep_AROC] = perfcurve(FoldsPool_True, FoldsPool_Score, posClass);
+        [Rep_FPR, Rep_TPR, Rep_Thr, Rep_AROC] = perfcurve(FoldsPool_True, FoldsPool_Score, posClass);
+        %         [~, Rep_TPRgrid, ~, Rep_AROC] = perfcurve(FoldsPool_True, FoldsPool_Score, posClass,  'XVals', cvReps.RepRoc_FPRgrid); % this seems easier but does not guarantees fixed length
+        
+        % We first make FPR unique (and keep stable order, monotone) to ensure interp1 stability
+        [Rep_FPRu, ia] = unique(Rep_FPR(:), 'stable');
+        Rep_TPRu = Rep_TPR(ia);
+        Rep_Thru = Rep_Thr(ia);
+        % Interpolate onto common grid (guaranteed fixed length)
+        
+        Rep_TPRgrid = interp1(Rep_FPRu, Rep_TPRu, cvReps.RepRoc_FPRgrid(:), 'linear', 'extrap');
         else
-            Rep_AROC = nan;
+            Rep_AROC = nan;     Rep_TPRgrid = nan(size(cvReps.RepRoc_FPRgrid));
         end
-        cvRuns.Rep_AROC(RepIdx) = Rep_AROC;
-    end
+        cvReps.Rep_AROC(RepIdx) = Rep_AROC;
+        cvReps.RepRoc_TPRgrid(RepIdx,:) = Rep_TPRgrid(:).';
+
+        % store unique FPR and TPR (NaN-padded)
+        L = numel(Rep_FPRu);
+        cvReps.RepRoc_nRocPts(RepIdx) = L;
+        cvReps.RepRoc_FPRu(RepIdx,1:L)  = Rep_FPRu(:).';
+        cvReps.RepRoc_TPRu(RepIdx,1:L)  = Rep_TPRu(:).';
+        cvReps.RepRoc_Thru(RepIdx,1:L) = Rep_Thru(:).';
+end
     
     % -------------------- fold-level outputs --------------------
-    cvRuns.RepFold_VipScores(RepIdx,:,:)   = RepFold_VipScores;
-    cvRuns.RepFold_OptRocPoint(RepIdx,:,:) = RepFold_OptRocPoint;
+    cvReps.RepFold_VipScores(RepIdx,:,:)   = RepFold_VipScores;
+    cvReps.RepFold_OptRocPoint(RepIdx,:,:) = RepFold_OptRocPoint;
     
     % VIP mean across folds within Rep (NaN-robust)
-    cvRuns.Rep_Vip_MeanAcrossFolds(RepIdx,:) = nanAverage(RepFold_VipScores, 1);
+    cvReps.Rep_Vip_MeanAcrossFolds(RepIdx,:) = nanAverage(RepFold_VipScores, 1);
 end
 
 %% ======================================================================
@@ -255,22 +329,22 @@ cvCombi.Sample_TrueYLabel = YLabel; % N×1
 cvCombi.Sample_SubjID     = subjID; % N×1
 
 % Median over reps per sample (via prctile; your display vector for boxplots/T-test)
-cvCombi.OverReps_Med_OutOfFold_Score = prctile(cvRuns.RepSample_OutOfFold_Score, 50, 1).'; % N×1
+cvCombi.OverReps_Med_OutOfFold_Score = prctile(cvReps.RepSample_OutOfFold_Score, 50, 1).'; % N×1
 
 % Tested at least once over reps
-cvCombi.OverReps_HasAnyRep_OutOfFold = any(~isnan(cvRuns.RepSample_OutOfFold_Score), 1).'; % N×1
+cvCombi.OverReps_HasAnyRep_OutOfFold = any(~isnan(cvReps.RepSample_OutOfFold_Score), 1).'; % N×1
 
 % Performance summaries reported as median + IQR over reps
-cvCombi.OverReps_MedIQR_AROC            = prctile(cvRuns.Rep_AROC,           [50 25 75]);
-cvCombi.OverReps_MedIQR_Acc            = prctile(cvRuns.Rep_Acc,           [50 25 75]);
-cvCombi.OverReps_MedIQR_F1_posClass             = prctile(cvRuns.Rep_F1_posClass,   [50 25 75]);
-cvCombi.OverReps_MedIQR_F1_negClass    = prctile(cvRuns.Rep_F1_negClass,   [50 25 75]);
+cvCombi.OverReps_MedIQR_AROC            = prctile(cvReps.Rep_AROC,           [50 25 75]);
+cvCombi.OverReps_MedIQR_Acc            = prctile(cvReps.Rep_Acc,           [50 25 75]);
+cvCombi.OverReps_MedIQR_F1_posClass             = prctile(cvReps.Rep_F1_posClass,   [50 25 75]);
+cvCombi.OverReps_MedIQR_F1_negClass    = prctile(cvReps.Rep_F1_negClass,   [50 25 75]);
 
 % VIP summary over reps (rep-level VIP already averaged across folds)
-cvCombi.OverReps_MedIQR_Vip = prctile(cvRuns.Rep_Vip_MeanAcrossFolds, [50 25 75], 1); % 3×P
+cvCombi.OverReps_MedIQR_Vip = prctile(cvReps.Rep_Vip_MeanAcrossFolds, [50 25 75], 1); % 3×P
 
 % Confusion matrix averaged over reps (legacy plotting convention Pred×True)
-OverReps_Mean_ConfMat_TruePred = squeeze(nanAverage(cvRuns.Rep_ConfMat_TruePred, 1)); % True×Pred
+OverReps_Mean_ConfMat_TruePred = squeeze(nanAverage(cvReps.Rep_ConfMat_TruePred, 1)); % True×Pred
 cvCombi.OverReps_Mean_ConfMat_PredTrue = OverReps_Mean_ConfMat_TruePred.';            % Pred×True
 
 % Percent of REAL class (REAL=True). With Pred×True, normalize each column.
@@ -278,16 +352,21 @@ colSum = sum(cvCombi.OverReps_Mean_ConfMat_PredTrue, 1);
 colSum(colSum==0) = NaN;
 cvCombi.OverReps_MeanPct_ConfMat_PredTrue = 100 * bsxfun(@rdivide, cvCombi.OverReps_Mean_ConfMat_PredTrue, colSum);
 
+% ROC curves: median TPR across runs, given fixed FPR points (grid intervals)
+cvCombi.OverReps_Roc_FPRgrid = cvReps.RepRoc_FPRgrid(:);
+cvCombi.OverReps_Roc_TPRgrid = prctile(cvReps.RepRoc_TPRgrid, 50, 1).';
 
 %%---- t test statistic on the predicted pls scores (from their median across runs) contrast between classes
 scores= cvCombi.OverReps_Med_OutOfFold_Score; 
 c0= cvCombi.Sample_TrueYLabel== min(cvCombi.Sample_TrueYLabel);
 c1= cvCombi.Sample_TrueYLabel== max(cvCombi.Sample_TrueYLabel);
 [H,P,CI,STATS] = ttest2( scores(c0), scores(c1));
-STATS.Pval = P;
+STATS.Pval = P; % NOTE: do not interpret this P !
 STATS.Hypothesis = H;
 cvCombi.ttest_Score_OverReps_Med_OutOfFold= STATS;
-
+% “median OOF scores per sample across reps” are not i.i.d. observations in a classical sense:
+% each sample’s score is produced by many overlapping training sets across reps,
+% so the induced dependence structure prevents from using this P value.
 end
 
 
@@ -384,7 +463,7 @@ end
 % % 
 % % Outputs:
 % % 
-% % cvRuns: A struct containing repetition-level results:
+% % cvReps: A struct containing repetition-level results:
 % % 
 % % RepSample_OutOfFold_Score: The out-of-fold predictions (continuous scores) for each sample across repetitions.
 % % 
